@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+# vendor PDFs (copyright, large) and network scans
+docs/vendor/
+scan*.md
+*-hosts.txt

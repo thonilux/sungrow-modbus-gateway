@@ -12,6 +12,24 @@ cp .env.example .env        # edit values
 python app.py
 ```
 
+## Docker
+
+Copy `.env.example` to `.env`, edit the Sungrow and MQTT settings, then run:
+
+```bash
+docker compose up -d --build
+docker compose logs -f sungrow-gateway
+```
+
+The dashboard is available at `http://127.0.0.1:5000/`. Stop it with:
+
+```bash
+docker compose down
+```
+
+The container runs as a non-root user. `.env`, vendor PDFs, and Python cache files
+are excluded from the image.
+
 ## Endpoints
 
 ```bash

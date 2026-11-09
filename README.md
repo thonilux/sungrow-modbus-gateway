@@ -30,6 +30,10 @@ docker compose down
 The container runs as a non-root user. `.env`, vendor PDFs, and Python cache files
 are excluded from the image.
 
+Docker Compose uses the Linux host network so the gateway can reach Sungrow and
+MQTT services through the server's WireGuard routes. `FLASK_PORT` is therefore
+bound directly on the server and the `ports` mapping is not needed.
+
 ## Endpoints
 
 ```bash

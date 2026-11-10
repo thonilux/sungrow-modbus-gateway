@@ -509,7 +509,7 @@ def index():
       const ms = result.mqtt_status || {};
       const progress = document.getElementById('progress');
       const log = document.getElementById('mqtt-log');
-      log.textContent = (ms.logs || []).join('\n') || 'Belum ada aktivitas MQTT';
+      log.textContent = (ms.logs || []).join('\\n') || 'Belum ada aktivitas MQTT';
       log.scrollTop = log.scrollHeight;
       document.getElementById('mqtt').textContent = `MQTT: ${ms.state || 'unknown'} · ${ms.broker || ''}`;
       if (ps.state === 'polling') progress.textContent = 'Sedang membaca register inverter...';

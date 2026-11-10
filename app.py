@@ -55,7 +55,16 @@ _mqtt_state: dict[str, Any] = {
     "broker": f"{MQTT_HOST}:{MQTT_PORT}",
     "last_connect_at": None,
     "last_error": None,
+    "logs": [],
 }
+
+
+def _mqtt_log(message: str, level: str = "INFO") -> None:
+    entry = f"{time.strftime('%H:%M:%S')} [{level}] {message}"
+    with _cache_lock:
+        logs = _mqtt_state.setdefault("logs", [])
+        logs.append(entry)
+        del logs[:-100]
 
 
 def _next_transaction_id() -> int:
@@ -247,28 +256,47 @@ def _read_data() -> dict[str, Any]:
 
 
 def _mqtt_payload(data: dict[str, Any]) -> dict[str, Any]:
-    """Map Sungrow values to the backend telemetry contract."""
-    mppt_voltages = [data.get(f"mppt_{n}_voltage_v") for n in range(1, 4)]
-    mppt_currents = [data.get(f"mppt_{n}_current_a") for n in range(1, 4)]
-    valid_voltages = [v for v in mppt_voltages if isinstance(v, (int, float))]
-    valid_currents = [v for v in mppt_currents if isinstance(v, (int, float))]
-    pv_voltage = max(valid_voltages) if valid_voltages else None
-    pv_current = sum(valid_currents) if valid_currents else None
+    """Build the MQTT v3 payload for the Sungrow inverter."""
     state = data.get("running_state")
     status = "on_grid" if state in (0, 0x40) else "standby"
+    fields = {
+        "pv_power": data.get("pv_power_w"),
+        "dc_active_energy": data.get("dc_active_energy_total_kwh"),
+        "daily_output_energy": data.get("daily_output_energy_kwh"),
+        "total_active_power": data.get("total_active_power_w"),
+        "reactive_power": data.get("reactive_power_var"),
+        "ac_voltage_phase_a": data.get("ac_voltage_a_v"),
+        "dc_voltage_mppt_1": data.get("v_dc_mppt_1_v"),
+        "mppt_1_current": data.get("mppt_1_current_a"),
+        "mppt_2_voltage": data.get("mppt_2_voltage_v"),
+        "mppt_2_current": data.get("mppt_2_current_a"),
+        "ac_current_phase_a": data.get("ac_current_a_a"),
+        "battery_power": data.get("battery_power_w"),
+        "battery_soc": data.get("battery_soc_percent"),
+        "battery_temperature": data.get("battery_temperature_c"),
+        "inside_temperature": data.get("inside_temperature_c"),
+        "load_power": data.get("load_power_w"),
+        "export_power": data.get("export_power_w"),
+        "meter_power": data.get("meter_power_w"),
+        "grid_frequency": data.get("grid_frequency_hz"),
+        "ac_power_factor": data.get("pf_ac"),
+        "active_export_energy": data.get("active_export_energy_kwh"),
+        "active_import_energy": data.get("active_import_energy_kwh"),
+        "backup_total_power": data.get("backup_total_power_w"),
+    }
     return {
-        "v": 1,
+        "v": 3,
         "boardId": MQTT_BOARD_ID,
-        "ts": int(time.time()),
         "batch": [
-            {"deviceId": "inv_sungrow", "key": "pv_voltage", "val": pv_voltage},
-            {"deviceId": "inv_sungrow", "key": "pv_current", "val": pv_current},
-            {"deviceId": "inv_sungrow", "key": "pv_power", "val": data.get("pv_power_w")},
-            {"deviceId": "inv_sungrow", "key": "pv_energy_total", "val": data.get("total_pv_generation_kwh")},
-            {"deviceId": "inv_sungrow", "key": "inv_power_out", "val": data.get("total_active_power_w")},
-            {"deviceId": "inv_sungrow", "key": "load_power", "val": data.get("load_power_w")},
-            {"deviceId": "inv_sungrow", "key": "inv_status", "val": status},
-            {"deviceId": "inv_sungrow", "key": "temp_internal", "val": data.get("inside_temperature_c")},
+            {
+                "d": "inv_sungrow",
+                "ts": int(data.get("read_at_unix") or time.time()),
+                "data": [
+                    {"k": key, "v": value}
+                    for key, value in {"inv_status": status, **fields}.items()
+                    if value is not None
+                ],
+            }
         ],
     }
 
@@ -276,6 +304,7 @@ def _mqtt_payload(data: dict[str, Any]) -> dict[str, Any]:
 def _mqtt_start() -> None:
     global _mqtt_client
     if not MQTT_USER or not MQTT_PASS:
+        _mqtt_log("MQTT disabled: credentials belum diisi", "WARN")
         return
     with _cache_lock:
         _mqtt_state["state"] = "connecting"
@@ -288,6 +317,7 @@ def _mqtt_start() -> None:
 
     def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
         if reason_code == 0:
+            _mqtt_log(f"Connected ke {MQTT_HOST}:{MQTT_PORT}")
             with _cache_lock:
                 _mqtt_state.update({"state": "connected", "last_connect_at": time.time(), "last_error": None})
             client.publish(MQTT_STATUS_TOPIC, json.dumps({
@@ -295,10 +325,12 @@ def _mqtt_start() -> None:
                 "ts": int(time.time()), "fw": MQTT_FW,
             }), qos=1, retain=True)
         else:
+            _mqtt_log(f"Connect gagal: reason {reason_code}", "ERROR")
             with _cache_lock:
                 _mqtt_state.update({"state": "error", "last_error": f"connect reason {reason_code}"})
 
     def on_disconnect(_client, _userdata, _disconnect_flags, reason_code, _properties=None):
+        _mqtt_log(f"Disconnected: reason {reason_code}", "WARN")
         with _cache_lock:
             _mqtt_state.update({"state": "disconnected", "last_error": f"disconnect reason {reason_code}"})
 
@@ -311,7 +343,26 @@ def _mqtt_start() -> None:
 
 def _mqtt_publish(data: dict[str, Any]) -> None:
     if _mqtt_client is not None:
-        _mqtt_client.publish(MQTT_TELEMETRY_TOPIC, json.dumps(_mqtt_payload(data)), qos=1)
+        payload = _mqtt_payload(data)
+        result = _mqtt_client.publish(MQTT_TELEMETRY_TOPIC, json.dumps(payload), qos=1)
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            _mqtt_log(f"PUBLISH {MQTT_TELEMETRY_TOPIC} · {len(payload['batch'][0]['data'])} fields")
+        else:
+            _mqtt_log(f"Publish gagal: rc {result.rc}", "ERROR")
+
+
+def _mqtt_schedule_loop() -> None:
+    """Publish the latest telemetry exactly at every minute boundary."""
+    while True:
+        now = time.time()
+        next_minute = (int(now) // 60 + 1) * 60
+        time.sleep(max(0.01, next_minute - now))
+        with _cache_lock:
+            data = dict(_cache["data"]) if _cache["data"] is not None else None
+        if data is not None:
+            _mqtt_publish(data)
+        else:
+            _mqtt_log("PUBLISH dilewati: belum ada data Sungrow", "WARN")
 
 
 def get_cached_data() -> dict[str, Any]:
@@ -329,7 +380,6 @@ def _poll_loop() -> None:
             _poll_state.update({"state": "polling", "started_at": started})
         try:
             data = _read_data()
-            _mqtt_publish(data)
             with _cache_lock:
                 _cache["timestamp"] = time.time()
                 _cache["data"] = data
@@ -358,6 +408,7 @@ def start_poller() -> None:
     if not _poller_started:
         _poller_started = True
         threading.Thread(target=_poll_loop, name="sungrow-poller", daemon=True).start()
+        threading.Thread(target=_mqtt_schedule_loop, name="mqtt-scheduler", daemon=True).start()
 
 
 @app.get("/")
@@ -385,6 +436,8 @@ def index():
     .value { font-size: 30px; font-weight: 700; margin-top: 10px; }
     .unit { color: #cbd5e1; font-size: 14px; margin-left: 4px; }
     .wide { grid-column: 1 / -1; }
+    .terminal { background: #020617; border: 1px solid #334155; border-radius: 14px; padding: 14px 16px; margin-top: 14px; color: #86efac; font: 13px Consolas, monospace; min-height: 100px; max-height: 260px; overflow: auto; white-space: pre-wrap; }
+    .clockbar { display: flex; gap: 18px; flex-wrap: wrap; margin: 0 0 14px; color: #cbd5e1; font: 14px Consolas, monospace; }
     footer { color: #64748b; margin-top: 22px; font-size: 13px; }
   </style>
 </head>
@@ -397,6 +450,7 @@ def index():
       <div id="mqtt" class="sub" style="text-align:right;margin-top:8px">MQTT: ...</div>
     </div>
   </header>
+  <div class="clockbar"><span>Clock: <strong id="clock">--:--:--</strong></span><span>Next MQTT publish: <strong id="next-publish">--s</strong></span></div>
   <section class="grid">
     <div class="card"><div class="label">PV Power / Total DC</div><div class="value"><span id="pv">-</span><span class="unit">W</span></div></div>
     <div class="card"><div class="label">DC Active Energy</div><div class="value"><span id="dcenergy">-</span><span class="unit">kWh</span></div></div>
@@ -423,6 +477,7 @@ def index():
     <div class="card"><div class="label">Backup Total Power</div><div class="value"><span id="backup">-</span><span class="unit">W</span></div></div>
     <div class="card wide"><div class="label">Power Flow Status</div><div class="value" id="flow">-</div></div>
   </section>
+  <section class="card wide"><div class="label">MQTT Terminal Log</div><div id="mqtt-log" class="terminal">Menunggu log MQTT...</div></section>
   <footer>
     <div>Read-only dashboard · refresh otomatis setiap 5 detik</div>
     <div id="progress">Poller sedang mulai...</div>
@@ -440,6 +495,11 @@ def index():
     mppt1i: 'mppt_1_current_a', mppt2v: 'mppt_2_voltage_v', mppt2i: 'mppt_2_current_a'
   };
   const fmt = v => typeof v === 'number' ? v.toLocaleString('id-ID', {maximumFractionDigits: 2}) : '-';
+  function updateClock() {
+    const now = new Date();
+    document.getElementById('clock').textContent = now.toLocaleTimeString('id-ID', {hour12: false});
+    document.getElementById('next-publish').textContent = `${60 - now.getSeconds()}s`;
+  }
   async function refresh() {
     const status = document.getElementById('status');
     try {
@@ -448,6 +508,9 @@ def index():
       const ps = result.poll_status || {};
       const ms = result.mqtt_status || {};
       const progress = document.getElementById('progress');
+      const log = document.getElementById('mqtt-log');
+      log.textContent = (ms.logs || []).join('\n') || 'Belum ada aktivitas MQTT';
+      log.scrollTop = log.scrollHeight;
       document.getElementById('mqtt').textContent = `MQTT: ${ms.state || 'unknown'} · ${ms.broker || ''}`;
       if (ps.state === 'polling') progress.textContent = 'Sedang membaca register inverter...';
       else if (ps.state === 'ok') progress.textContent = `Berhasil ${ps.success_count}x · durasi ${ps.duration_seconds}s · error ${ps.error_count}x`;
@@ -465,7 +528,7 @@ def index():
       console.error(err);
     }
   }
-  refresh(); setInterval(refresh, 5000);
+  updateClock(); setInterval(updateClock, 250); refresh(); setInterval(refresh, 5000);
 </script>
 </body>
 </html>

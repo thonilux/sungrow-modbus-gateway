@@ -28,9 +28,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 MQTT_BOARD_ID = os.getenv("MQTT_BOARD_ID", "RB000000000000")
-MQTT_FW = os.getenv("MQTT_FW", "0.1.0")
 MQTT_TELEMETRY_TOPIC = f"ress/{MQTT_BOARD_ID}/telemetry"
-MQTT_STATUS_TOPIC = f"ress/{MQTT_BOARD_ID}/status"
 
 app = Flask(__name__)
 _cache: dict[str, Any] = {"timestamp": 0.0, "data": None}
@@ -50,6 +48,7 @@ _poll_state: dict[str, Any] = {
     "duration_seconds": None,
 }
 _mqtt_client: mqtt.Client | None = None
+_mqtt_seq = int(time.time())  # telemetry sequence, string in payload (same as ESP32 contract v3)
 _mqtt_state: dict[str, Any] = {
     "state": "disabled",
     "broker": f"{MQTT_HOST}:{MQTT_PORT}",
@@ -260,33 +259,36 @@ def _mqtt_payload(data: dict[str, Any]) -> dict[str, Any]:
     state = data.get("running_state")
     status = "on_grid" if state in (0, 0x40) else "standby"
     fields = {
-        "pv_power": data.get("pv_power_w"),
-        "dc_active_energy": data.get("dc_active_energy_total_kwh"),
-        "daily_output_energy": data.get("daily_output_energy_kwh"),
-        "total_active_power": data.get("total_active_power_w"),
-        "reactive_power": data.get("reactive_power_var"),
-        "ac_voltage_phase_a": data.get("ac_voltage_a_v"),
-        "dc_voltage_mppt_1": data.get("v_dc_mppt_1_v"),
-        "mppt_1_current": data.get("mppt_1_current_a"),
-        "mppt_2_voltage": data.get("mppt_2_voltage_v"),
-        "mppt_2_current": data.get("mppt_2_current_a"),
-        "ac_current_phase_a": data.get("ac_current_a_a"),
-        "battery_power": data.get("battery_power_w"),
-        "battery_soc": data.get("battery_soc_percent"),
-        "battery_temperature": data.get("battery_temperature_c"),
-        "inside_temperature": data.get("inside_temperature_c"),
-        "load_power": data.get("load_power_w"),
-        "export_power": data.get("export_power_w"),
-        "meter_power": data.get("meter_power_w"),
-        "grid_frequency": data.get("grid_frequency_hz"),
-        "ac_power_factor": data.get("pf_ac"),
-        "active_export_energy": data.get("active_export_energy_kwh"),
-        "active_import_energy": data.get("active_import_energy_kwh"),
-        "backup_total_power": data.get("backup_total_power_w"),
+        "pv_p": data.get("pv_power_w"),
+        "pv_e": data.get("dc_active_energy_total_kwh"),
+        "e_today": data.get("daily_output_energy_kwh"),
+        "inv_p_out": data.get("total_active_power_w"),
+        "q": data.get("reactive_power_var"),
+        "v_a": data.get("ac_voltage_a_v"),
+        "mppt1_v": data.get("v_dc_mppt_1_v"),
+        "mppt1_i": data.get("mppt_1_current_a"),
+        "mppt2_v": data.get("mppt_2_voltage_v"),
+        "mppt2_i": data.get("mppt_2_current_a"),
+        "i_a": round(data["ac_current_a_a"], 1) if isinstance(data.get("ac_current_a_a"), (int, float)) else None,
+        "bat_p": data.get("battery_power_w"),
+        "bat_soc": data.get("battery_soc_percent"),
+        "bat_temp": data.get("battery_temperature_c"),
+        "t_int": data.get("inside_temperature_c"),
+        "load_p": data.get("load_power_w"),
+        "exp_p": data.get("export_power_w"),
+        "grid_p": data.get("meter_power_w"),
+        "f": data.get("grid_frequency_hz"),
+        "pf": data.get("pf_ac"),
+        "e_exp": data.get("active_export_energy_kwh"),
+        "e_imp": data.get("active_import_energy_kwh"),
+        "bkp_p": data.get("backup_total_power_w"),
     }
+    global _mqtt_seq
+    _mqtt_seq += 1
     return {
         "v": 3,
         "boardId": MQTT_BOARD_ID,
+        "seq": str(_mqtt_seq),
         "batch": [
             {
                 "d": "inv_sungrow",
@@ -308,22 +310,15 @@ def _mqtt_start() -> None:
         return
     with _cache_lock:
         _mqtt_state["state"] = "connecting"
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_BOARD_ID)
+    # ClientID must differ from the real board (ESP32) to avoid session takeover.
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"{MQTT_BOARD_ID}-sim")
     client.username_pw_set(MQTT_USER, MQTT_PASS)
-    client.will_set(MQTT_STATUS_TOPIC, json.dumps({
-        "v": 1, "boardId": MQTT_BOARD_ID, "online": False,
-        "ts": int(time.time()), "fw": MQTT_FW,
-    }), qos=1, retain=True)
 
     def on_connect(_client, _userdata, _flags, reason_code, _properties=None):
         if reason_code == 0:
             _mqtt_log(f"Connected ke {MQTT_HOST}:{MQTT_PORT}")
             with _cache_lock:
                 _mqtt_state.update({"state": "connected", "last_connect_at": time.time(), "last_error": None})
-            client.publish(MQTT_STATUS_TOPIC, json.dumps({
-                "v": 1, "boardId": MQTT_BOARD_ID, "online": True,
-                "ts": int(time.time()), "fw": MQTT_FW,
-            }), qos=1, retain=True)
         else:
             _mqtt_log(f"Connect gagal: reason {reason_code}", "ERROR")
             with _cache_lock:
